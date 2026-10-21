@@ -1,0 +1,10 @@
+===== FIXED (target 572fd11 - legacy-aware identity match) =====
+live watcher pid=1918215  recorded identity=Wed\ Oct\ 21\ 18:34:33\ 2026\ sleep\ 300
+RESULT: healthy -> guard stayed silent (no false alarm)
+
+===== BASE (2c93247 - strict identity equality) =====
+live watcher pid=1918271  recorded identity=Wed\ Oct\ 21\ 18:34:33\ 2026\ sleep\ 300
+RESULT: FALSE ALARM -> guard reported the live watcher DOWN
+●  WATCHER DOWN - SUPERVISION IS OFF
+●  1 task(s) in flight, but no live watcher process holds this home lock (last beat: 0s ago).
+

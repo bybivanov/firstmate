@@ -1,0 +1,8 @@
+# BASE library (2c93247) - new regression tests:
+10:ok - watcher health survives a drifting ps lstart and still rejects a dead pid
+11:not ok - live watcher with a legacy lock identity was not healthy
+
+# TARGET library (572fd11) - same tests:
+10:ok - watcher health survives a drifting ps lstart and still rejects a dead pid
+11:ok - legacy ps lock identity keeps its live watcher and rejects a different process
+12:ok - watcher health rejects a reused pid under either identity form
