@@ -1030,21 +1030,26 @@ fm_pending_reply_send_recovery() {  # <state-dir> <corr_id>
   return 1
 }
 
+# Run a bin/fm-wake-lib.sh process-identity function, which owns the recorded
+# identity format and its legacy matching. When the wake library is not already
+# loaded, a subshell sources it so its source-time globals stay out of this one.
+_fm_pending_reply_identity_call() {  # <function> <args...>
+  if command -v "$1" >/dev/null 2>&1; then
+    "$@"
+    return
+  fi
+  ( . "$_FM_PENDING_REPLY_LIB_DIR/fm-wake-lib.sh" >/dev/null 2>&1 || exit 1; "$@" )
+}
+
 fm_pending_reply_pid_identity() {  # <pid>
-  local pid=$1 identity
-  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-  identity=$(COLUMNS=10000 LC_ALL=C ps -p "$pid" -o lstart= -o command= 2>/dev/null) || return 1
-  [ -n "$identity" ] || return 1
-  printf '%s' "$identity"
+  _fm_pending_reply_identity_call fm_pid_identity "$1" 2>/dev/null
 }
 
 fm_pending_reply_sender_alive() {  # <record-path>
-  local rec=$1 pid expected actual
+  local rec=$1 pid expected
   pid=$(fm_pending_reply_get "$rec" recovery_sender_pid)
   expected=$(fm_pending_reply_get "$rec" recovery_sender_identity)
-  [ -n "$expected" ] || return 1
-  actual=$(fm_pending_reply_pid_identity "$pid") || return 1
-  [ "$actual" = "$expected" ]
+  _fm_pending_reply_identity_call fm_pid_identity_matches "$pid" "$expected"
 }
 
 fm_pending_reply_finish_recovery() {  # <state-dir> <corr_id> <confirmed|failed>

@@ -540,6 +540,17 @@ test_recovery_attempt_is_never_reinjected() {
   fm_pending_reply_tick_one "$state" "$live_corr" unknown || fail "live recovery tick failed"
   [ "$(phase_of "$state" "$live_corr")" = recovery_sending ] \
     || fail "live recovery must remain in progress without elapsed-time inference"
+  if [ -r "/proc/$live_pid/stat" ] && LC_ALL=C ps -p "$live_pid" -o lstart= -o command= >/dev/null 2>&1; then
+    # A sender recorded by a build that always used the ps lstart+command form
+    # is still the same live sender after an upgrade to the /proc form.
+    fm_pending_reply_set "$live_rec" recovery_sender_identity \
+      "$(COLUMNS=10000 LC_ALL=C ps -p "$live_pid" -o lstart= -o command= | sed 's/^[[:space:]]*//')" \
+      || fail "legacy sender identity commit failed"
+    fm_pending_reply_sender_alive "$live_rec" || fail "legacy-format live sender identity was not recognized"
+    fm_pending_reply_set "$live_rec" recovery_sender_identity "Thu Jan  1 00:00:00 1998 bash" \
+      || fail "forged sender identity commit failed"
+    ! fm_pending_reply_sender_alive "$live_rec" || fail "forged legacy sender identity matched a live pid"
+  fi
   corr=$(fm_pending_reply_create "$home" "$state" hibit "crashed recovery")
   fm_pending_reply_mark_delivered "$state" "$corr"
   fm_pending_reply_mark_turn_completed "$state" "$corr" request
