@@ -74,19 +74,27 @@ fm_pid_alive() {
   kill -0 "$pid" 2>/dev/null
 }
 
+# fm_pid_identity <pid>
+# The single owner of the recorded process-identity format that every pid-file
+# lock and owner record in this repo stores and later re-checks.
+# Prefer a Linux-compatible /proc when present: stat field 22 (starttime, clock
+# ticks since boot) never changes for a process, so it is immune to the
+# wall-clock steps that re-render the ps lstart fallback's date. On WSL2 that
+# date walks forward about a second every minute or two for the same live pid
+# (CLOCK_REALTIME drifting against the boot clock, e.g. after host sleep), which
+# would evict a live watcher; combining the full NUL-separated cmdline keeps PID
+# reuse a mismatch even on a tick collision.
+# Git Bash/MSYS exposes these compatible files but its Cygwin ps rejects the
+# portable fallback's -o fields, so capability detection must not key on uname.
+# Where no compatible /proc exists (macOS), the ps lstart+command form is used.
+# Compare a recorded identity through fm_pid_identity_matches, not with `=`.
 fm_pid_identity() {
-  local pid=$1 out proc_root stat_line starttime cmdline_hex identity_key
+  local pid=$1 proc_root stat_line starttime cmdline_hex identity_key
   local -a stat_fields
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
   proc_root=${FM_PROC_ROOT_OVERRIDE:-/proc}
-  # Prefer a Linux-compatible /proc when present: stat field 22 (starttime, clock ticks since boot) is
-  # immune to the wall-clock steps that re-render the ps lstart fallback's date
-  # (observed as WSL2 btime drift) and would evict a live watcher; combining the
-  # full NUL-separated cmdline keeps PID reuse a mismatch even on a tick collision.
-  # Git Bash/MSYS exposes these compatible files but its Cygwin ps rejects the
-  # portable fallback's -o fields, so capability detection must not key on uname.
   if [ -r "$proc_root/$pid/stat" ] && [ -r "$proc_root/$pid/cmdline" ]; then
     stat_line=$(cat "$proc_root/$pid/stat" 2>/dev/null) || return 1
     # After the final comm delimiter, array index 19 is proc stat field 22.
@@ -103,17 +111,53 @@ fm_pid_identity() {
     printf '%s=%s cmdline-hex=%s\n' "$identity_key" "$starttime" "$cmdline_hex"
     return 0
   fi
+  _fm_pid_identity_ps "$pid"
+}
+
+# The ps lstart+command identity: the fallback where no compatible /proc exists,
+# and the legacy format records written before /proc identities existed.
+_fm_pid_identity_ps() {
+  local pid=$1 out
   # Pin LC_ALL=C so lstart's date format is locale-invariant: the identity is
   # written under one locale but re-read under the machine's ambient locale, which
   # would otherwise mismatch on a non-C locale (e.g. ko_KR) and reject a live watcher.
   # Pin COLUMNS wide so the command column is never cut to the ambient terminal
   # width: the identity is written from a wide shell but re-read inside a
   # narrow-COLUMNS hook, where a truncated command would likewise reject a live
-  # watcher (issue #799). This mirrors fm_pending_reply_pid_identity, which pins the
-  # same width for the same reason.
+  # watcher (issue #799).
   out=$(COLUMNS=10000 LC_ALL=C ps -p "$pid" -o lstart= -o command= 2>/dev/null) || return 1
   [ -n "$out" ] || return 1
   printf '%s\n' "$out" | sed 's/^[[:space:]]*//'
+}
+
+# fm_pid_identity_matches <pid> <recorded-identity> [current-identity]
+# True when <pid> is still the process <recorded-identity> was taken from.
+# Pass [current-identity] when the caller already read fm_pid_identity <pid>.
+# Legacy migration: a record without a /proc key (linux-starttime= or
+# proc-starttime=) was written by a build that always used the ps form, so on a
+# /proc host it is re-checked against the ps form instead of being declared a
+# different process. That keeps an upgrade from evicting a still-running
+# old-build owner or starting a second one beside it; the legacy comparison
+# keeps the old build's exact semantics, including its wall-clock sensitivity,
+# and disappears once that owner exits and its successor records a /proc form.
+# A dead, reused, or unreadable pid never matches either form.
+fm_pid_identity_matches() {
+  local pid=$1 recorded=$2 current=${3-} legacy
+  [ -n "$recorded" ] || return 1
+  if [ "$#" -lt 3 ]; then
+    current=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
+  fi
+  [ -n "$current" ] || return 1
+  [ "$current" = "$recorded" ] && return 0
+  case "$current" in
+    linux-starttime=*|proc-starttime=*) ;;
+    *) return 1 ;;
+  esac
+  case "$recorded" in
+    linux-starttime=*|proc-starttime=*) return 1 ;;
+  esac
+  legacy=$(_fm_pid_identity_ps "$pid" 2>/dev/null) || return 1
+  [ -n "$legacy" ] && [ "$legacy" = "$recorded" ]
 }
 
 fm_path_mtime() {
@@ -177,7 +221,7 @@ fm_watcher_lock_unheld() {
 
 FM_WATCHER_MATCHED_IDENTITY=
 fm_watcher_lock_matches_pid() {
-  local state=$1 watch_path=$2 pid=$3 home=${4:-$FM_HOME} lockdir lock_home lock_path lock_identity current_identity
+  local state=$1 watch_path=$2 pid=$3 home=${4:-$FM_HOME} lockdir lock_home lock_path lock_identity
   FM_WATCHER_MATCHED_IDENTITY=
   lockdir="$state/.watch.lock"
   lock_home=$(cat "$lockdir/fm-home" 2>/dev/null || true)
@@ -185,9 +229,7 @@ fm_watcher_lock_matches_pid() {
   lock_identity=$(cat "$lockdir/pid-identity" 2>/dev/null || true)
   [ "$lock_home" = "$home" ] || return 1
   [ "$lock_path" = "$watch_path" ] || return 1
-  [ -n "$lock_identity" ] || return 1
-  current_identity=$(fm_pid_identity "$pid") || return 1
-  [ "$current_identity" = "$lock_identity" ] || return 1
+  fm_pid_identity_matches "$pid" "$lock_identity" || return 1
   FM_WATCHER_MATCHED_IDENTITY=$lock_identity
 }
 
@@ -372,16 +414,13 @@ fm_extension_pair_owns_supervision() {  # <state> <extension-dir> <source:marker
 # a daemon that stops restarting its watcher still fails supervision once the
 # beacon passes grace.
 fm_afk_daemon_owns_supervision() {
-  local state=$1 lockdir pid recorded current
+  local state=$1 lockdir pid recorded
   [ -e "$state/.afk" ] || return 1
   lockdir="$state/.supervise-daemon.lock"
   pid=$(cat "$lockdir/pid" 2>/dev/null) || return 1
   fm_pid_alive "$pid" || return 1
   recorded=$(cat "$lockdir/pid-identity" 2>/dev/null) || return 1
-  [ -n "$recorded" ] || return 1
-  current=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
-  [ -n "$current" ] || return 1
-  [ "$current" = "$recorded" ]
+  fm_pid_identity_matches "$pid" "$recorded"
 }
 
 # fm_afk_mode <state>
@@ -1891,7 +1930,7 @@ fm_pid_descends_from() {  # <pid> <ancestor>
 # build's entry gets its deference from its held role-carrying lock through
 # the legacy shim, and anything else must not defer.
 fm_autoarm_claim_open() {  # <state-dir> [grace]
-  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} epoch current lock_pid lock_identity recorded
+  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} epoch lock_pid recorded
   epoch="$state/.claude-autoarm-epoch"
   case "$grace" in
     ''|*[!0-9]*|0) grace=300 ;;
@@ -1899,10 +1938,7 @@ fm_autoarm_claim_open() {  # <state-dir> [grace]
   fm_autoarm_ledger_read "$state" || return 1
   [ "$FM_AUTOARM_OUTCOME" = arming ] || return 1
   fm_pid_alive "$FM_AUTOARM_OWNER" || return 1
-  [ -n "$FM_AUTOARM_IDENTITY" ] || return 1
-  current=$(fm_pid_identity "$FM_AUTOARM_OWNER" 2>/dev/null) || return 1
-  [ -n "$current" ] || return 1
-  [ "$current" = "$FM_AUTOARM_IDENTITY" ] || return 1
+  fm_pid_identity_matches "$FM_AUTOARM_OWNER" "$FM_AUTOARM_IDENTITY" || return 1
   lock_pid=$(sed -n '1p' "$state/.lock" 2>/dev/null || true)
   case "$lock_pid" in
     ''|*[!0-9]*) return 1 ;;
@@ -1910,8 +1946,7 @@ fm_autoarm_claim_open() {  # <state-dir> [grace]
   if ! fm_pid_descends_from "$FM_AUTOARM_OWNER" "$lock_pid"; then
     [ -n "$FM_AUTOARM_OWNER_SESSION_ID" ] || return 1
     [ -n "$FM_AUTOARM_OWNER_LOCK_IDENTITY" ] || return 1
-    lock_identity=$(fm_pid_identity "$lock_pid" 2>/dev/null) || return 1
-    [ "$lock_identity" = "$FM_AUTOARM_OWNER_LOCK_IDENTITY" ] || return 1
+    fm_pid_identity_matches "$lock_pid" "$FM_AUTOARM_OWNER_LOCK_IDENTITY" || return 1
     _fm_wake_require_session_lock
     recorded=$(fm_session_lock_recorded_session_id "$state" 2>/dev/null || true)
     [ -n "$recorded" ] && [ "$recorded" = "$FM_AUTOARM_OWNER_SESSION_ID" ] || return 1
@@ -2140,7 +2175,7 @@ fm_autoarm_claim_abandoned() {  # <state-dir> [grace]
   esac
   recorded=$(cat "$lock/pid-identity" 2>/dev/null || true)
   if [ -n "$recorded" ] && current=$(fm_pid_identity "$pid" 2>/dev/null) \
-    && [ -n "$current" ] && [ "$current" != "$recorded" ]; then
+    && [ -n "$current" ] && ! fm_pid_identity_matches "$pid" "$recorded" "$current"; then
     return 0
   fi
   owner=$(_fm_autoarm_epoch_field "$epoch" owner_pid) || return 1
@@ -2176,7 +2211,7 @@ fm_autoarm_claim_abandoned() {  # <state-dir> [grace]
 # TERM and the ledger graft below, keeping the documented bounded
 # upgrade-window residual instead of the deadlock.
 fm_autoarm_release_abandoned() {  # <state-dir> [grace]
-  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} lock steal epoch lock_pid recorded current owner line1 tmp i
+  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} lock steal epoch lock_pid recorded owner line1 tmp i
   lock="$state/.claude-autoarm.lock"
   steal="$lock.steal"
   epoch="$state/.claude-autoarm-epoch"
@@ -2189,8 +2224,7 @@ fm_autoarm_release_abandoned() {  # <state-dir> [grace]
   lock_pid=$(cat "$lock/pid" 2>/dev/null || true)
   recorded=$(cat "$lock/pid-identity" 2>/dev/null || true)
   if [ -n "$recorded" ] && fm_pid_alive "$lock_pid" \
-    && current=$(fm_pid_identity "$lock_pid" 2>/dev/null) \
-    && [ -n "$current" ] && [ "$current" = "$recorded" ]; then
+    && fm_pid_identity_matches "$lock_pid" "$recorded"; then
     # A live pid still answering to the recorded identity IS the genuine
     # legacy owner (proven stuck or blocked after a terminal write): retire it
     # before removing its lock, because old-build code cannot re-check
@@ -2484,7 +2518,7 @@ fm_wake_grant_rows_valid() {  # <rows-file>
 # not a match, so uncertainty reads as "no live owner".
 fm_wake_branch_owner_matches() {  # <owner-file> [<pid>] [<generation>]
   local file=$1 expected_pid=${2:-} expected_generation=${3:-}
-  local version pid identity generation current extra
+  local version pid identity generation extra
   [ -f "$file" ] && [ ! -L "$file" ] || return 1
   exec 8< "$file" || return 1
   IFS= read -r version <&8 || { exec 8<&-; return 1; }
@@ -2498,8 +2532,7 @@ fm_wake_branch_owner_matches() {  # <owner-file> [<pid>] [<generation>]
   case "$generation" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
   [ -z "$expected_pid" ] || [ "$pid" = "$expected_pid" ] || return 1
   [ -z "$expected_generation" ] || [ "$generation" = "$expected_generation" ] || return 1
-  current=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
-  [ -n "$current" ] && [ "$current" = "$identity" ]
+  fm_pid_identity_matches "$pid" "$identity"
 }
 
 # 0 when a branch grant is currently reserving rows: a valid row snapshot whose

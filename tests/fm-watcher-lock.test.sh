@@ -1505,6 +1505,129 @@ test_proc_pid_identity_ignores_wall_clock_and_detects_pid_reuse() {
   pass "/proc process identity detects pid reuse"
 }
 
+# Seed this home's watcher lock for <pid> with <identity> and a fresh beacon,
+# exactly the fields fm_watcher_healthy re-checks.
+seed_watch_lock_identity() {
+  local dir=$1 pid=$2 identity=$3 lockdir
+  lockdir="$dir/state/.watch.lock"
+  mkdir -p "$lockdir"
+  printf '%s\n' "$pid" > "$lockdir/pid"
+  printf '%s\n' "$dir" > "$lockdir/fm-home"
+  printf '%s\n' "$WATCH" > "$lockdir/watcher-path"
+  printf '%s\n' "$identity" > "$lockdir/pid-identity"
+  touch "$dir/state/.last-watcher-beat"
+}
+
+watcher_lock_healthy() {  # <dir> [env assignments...]
+  local dir=$1
+  shift
+  # shellcheck disable=SC2016 # The single-quoted script expands in the child bash.
+  env "$@" FM_HOME="$dir" FM_STATE_OVERRIDE="$dir/state" \
+    bash -c '. "$1"; fm_watcher_healthy "$2" "$3" 300 "$4"' _ "$LIB" "$dir/state" "$WATCH" "$dir"
+}
+
+test_watcher_health_survives_lstart_drift() {
+  # On WSL2 the wall clock drifts against the boot clock, so ps lstart for one
+  # live pid walks forward about a second every minute or two. A stub ps that
+  # drifts on every call reproduces that; the /proc identity must keep the live
+  # watcher healthy across every re-check.
+  local dir fakebin counter live identity first second i
+  if [ ! -r "/proc/$$/stat" ] || [ ! -r "/proc/$$/cmdline" ]; then
+    pass "lstart drift health check skipped where no compatible /proc exists"
+    return
+  fi
+  dir=$(make_case lstart-drift-health)
+  fakebin="$dir/drift-ps"
+  counter="$dir/drift-ps.count"
+  mkdir -p "$fakebin"
+  printf '0\n' > "$counter"
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+n=$(cat "$FAKE_PS_DRIFT_COUNTER")
+printf '%s\n' "$((n + 1))" > "$FAKE_PS_DRIFT_COUNTER"
+printf 'Wed Oct 21 15:21:%02d 2026 sleep 300\n' "$((27 + n))"
+SH
+  chmod +x "$fakebin/ps"
+  sleep 300 &
+  live=$!
+  identity=$(PATH="$fakebin:$PATH" FAKE_PS_DRIFT_COUNTER="$counter" FM_STATE_OVERRIDE="$dir/state" \
+    bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live") || fail "could not read drift-case identity"
+  first=$(PATH="$fakebin:$PATH" FAKE_PS_DRIFT_COUNTER="$counter" ps -p "$live" -o lstart= -o command=)
+  second=$(PATH="$fakebin:$PATH" FAKE_PS_DRIFT_COUNTER="$counter" ps -p "$live" -o lstart= -o command=)
+  [ "$first" != "$second" ] || fail "drift stub did not drift ('$first')"
+  seed_watch_lock_identity "$dir" "$live" "$identity"
+  i=0
+  while [ "$i" -lt 3 ]; do
+    watcher_lock_healthy "$dir" PATH="$fakebin:$PATH" FAKE_PS_DRIFT_COUNTER="$counter" \
+      || { kill "$live" 2>/dev/null; fail "live watcher went unhealthy under drifting lstart (check $i)"; }
+    i=$((i + 1))
+  done
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  if watcher_lock_healthy "$dir" PATH="$fakebin:$PATH" FAKE_PS_DRIFT_COUNTER="$counter"; then
+    fail "dead watcher pid still counted healthy"
+  fi
+  pass "watcher health survives a drifting ps lstart and still rejects a dead pid"
+}
+
+test_watcher_health_accepts_legacy_lock_identity() {
+  # A lock written by a build that always recorded the ps lstart+command form
+  # must keep its still-running watcher healthy after an upgrade, rather than
+  # being evicted and replaced by a second watcher.
+  local dir live legacy forged
+  if [ ! -r "/proc/$$/stat" ] || ! LC_ALL=C ps -p "$$" -o lstart= -o command= >/dev/null 2>&1; then
+    pass "legacy lock identity check skipped without both /proc and ps -o lstart="
+    return
+  fi
+  dir=$(make_case legacy-lock-identity)
+  sleep 300 &
+  live=$!
+  legacy=$(COLUMNS=10000 LC_ALL=C ps -p "$live" -o lstart= -o command= | sed 's/^[[:space:]]*//')
+  [ -n "$legacy" ] || fail "could not capture a legacy ps identity"
+  seed_watch_lock_identity "$dir" "$live" "$legacy"
+  watcher_lock_healthy "$dir" \
+    || { kill "$live" 2>/dev/null; fail "live watcher with a legacy lock identity was not healthy"; }
+  forged="Thu Jan  1 00:00:00 1998 ${legacy#* * * * * }"
+  [ "$forged" != "$legacy" ] || fail "forged legacy identity did not differ"
+  seed_watch_lock_identity "$dir" "$live" "$forged"
+  if watcher_lock_healthy "$dir"; then
+    kill "$live" 2>/dev/null
+    fail "legacy lock identity of a different process counted healthy"
+  fi
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  pass "legacy ps lock identity keeps its live watcher and rejects a different process"
+}
+
+test_watcher_health_rejects_reused_pid() {
+  # A live pid whose /proc starttime differs from the recorded one is a reused
+  # pid, whether the record is the current /proc form or a legacy ps form.
+  local dir proc_root live recorded
+  dir=$(make_case reused-pid-health)
+  proc_root="$dir/proc"
+  sleep 300 &
+  live=$!
+  write_fake_proc_identity "$proc_root" "$live" 555000
+  recorded=$(FM_PROC_ROOT_OVERRIDE="$proc_root" FM_STATE_OVERRIDE="$dir/state" \
+    bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live") || fail "could not read fake reused-pid identity"
+  seed_watch_lock_identity "$dir" "$live" "$recorded"
+  watcher_lock_healthy "$dir" FM_PROC_ROOT_OVERRIDE="$proc_root" \
+    || { kill "$live" 2>/dev/null; fail "matching /proc identity was not healthy"; }
+  write_fake_proc_identity "$proc_root" "$live" 555001
+  if watcher_lock_healthy "$dir" FM_PROC_ROOT_OVERRIDE="$proc_root"; then
+    kill "$live" 2>/dev/null
+    fail "reused pid with a new /proc starttime counted healthy"
+  fi
+  seed_watch_lock_identity "$dir" "$live" "Thu Jan  1 00:00:00 1998 sleep 300"
+  if watcher_lock_healthy "$dir" FM_PROC_ROOT_OVERRIDE="$proc_root"; then
+    kill "$live" 2>/dev/null
+    fail "reused pid matched a legacy identity it was never recorded from"
+  fi
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  pass "watcher health rejects a reused pid under either identity form"
+}
+
 test_stale_watch_reclaim_publishes_before_clear() {
   local dir state lockdir rc token
   dir=$(make_case stale-watch-publish-before-clear)
@@ -1574,6 +1697,9 @@ test_pid_identity_is_locale_invariant
 test_pid_identity_is_terminal_width_invariant
 test_proc_pid_identity_ignores_wall_clock_and_detects_pid_reuse
 test_msys_pid_identity_uses_proc
+test_watcher_health_survives_lstart_drift
+test_watcher_health_accepts_legacy_lock_identity
+test_watcher_health_rejects_reused_pid
 test_stale_watch_lock_reclaimed
 test_stale_watch_reclaim_publishes_before_clear
 test_live_stale_watch_lock_is_actionable
